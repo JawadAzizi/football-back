@@ -9,14 +9,14 @@ use Illuminate\Support\Str;
 class CreateApi extends Command
 {
     protected $signature = 'make:api {name : The singular name of the model}';
-    protected $description = 'Create a full Smart API CRUD with single-prop Array Responses';
+    protected $description = 'Create a full API CRUD with Search/Filter traits and single commented examples';
 
     public function handle()
     {
-        $name = ucfirst(Str::singular($this->argument('name'))); 
-        $pluralName = Str::plural(strtolower($name));           
-        $searchTable = Str::snake($pluralName);                  
-        $modelVariable = Str::camel($name);                     
+        $name = ucfirst(Str::singular($this->argument('name')));
+        $pluralName = Str::plural(strtolower($name));
+        $searchTable = Str::snake($pluralName);
+        $modelVariable = Str::camel($name);
 
         $this->info("Parsing migration for: {$searchTable}...");
         $migrationData = $this->parseMigration($searchTable);
@@ -26,24 +26,29 @@ class CreateApi extends Command
             return;
         }
 
-        $this->ensureTraitExists();
+        // 1. Ensure Shared Traits exist
+        $this->ensureApiResponseTrait();
+        $this->ensureSearchTrait();
+        $this->ensureFilterTrait();
+
+        // 2. Create Model, Request, and Controller
         $this->createModel($name, $migrationData['table'], $migrationData['fields']);
         $this->createRequest($name, $migrationData['rules']);
-        $this->createController($name, $modelVariable);
+        $this->createController($name, $modelVariable, $migrationData);
+
+        // 3. Add Routes to api.php
         $this->addRoute($name, $pluralName, $modelVariable);
 
-        $this->info("Successfully created Smart API for {$name}!");
+        $this->info("Successfully created API for {$name}!");
     }
 
-    /**
-     * Creates the Smart Trait with Single Prop Array logic
-     */
-    protected function ensureTraitExists()
+    protected function ensureApiResponseTrait()
     {
         $path = app_path('Traits/ApiResponseTrait.php');
         File::ensureDirectoryExists(app_path('Traits'));
+        if (File::exists($path)) return;
 
-        $template = "<?php
+        File::put($path, "<?php
 
 namespace App\Traits;
 
@@ -52,10 +57,6 @@ use Illuminate\Http\Response;
 
 trait ApiResponseTrait
 {
-    /**
-     * Smart API Response
-     * @param array \$props ['data' => mixed, 'action' => string, 'message' => string, 'code' => int]
-     */
     public function apiResponse(array \$props): JsonResponse
     {
         \$action  = \$props['action'] ?? 'list';
@@ -82,8 +83,63 @@ trait ApiResponseTrait
             'meta'    => isset(\$data['current_page']) ? array_diff_key(\$data, ['data' => []]) : null
         ], \$finalCode);
     }
-}";
-        File::put($path, $template);
+}");
+    }
+
+    protected function ensureSearchTrait()
+    {
+        $path = app_path('Traits/ApplySearch.php');
+        if (File::exists($path)) return;
+
+        File::put($path, "<?php
+
+namespace App\Traits;
+
+use Illuminate\Database\Eloquent\Builder;
+
+trait ApplySearch
+{
+    public function applySearch(Builder \$query, array \$searchData, string \$operator = 'LIKE'): Builder
+    {
+        if (empty(\$searchData)) return \$query;
+
+        \$query->where(function (\$q) use (\$searchData, \$operator) {
+            foreach (\$searchData as \$column => \$value) {
+                if (!is_null(\$value) && \$value !== '') {
+                    \$finalValue = (\$operator === 'LIKE') ? \"%{\$value}%\" : \$value;
+                    \$q->orWhere(\$column, \$operator, \$finalValue);
+                }
+            }
+        });
+
+        return \$query;
+    }
+}");
+    }
+
+    protected function ensureFilterTrait()
+    {
+        $path = app_path('Traits/ApplyFilter.php');
+        if (File::exists($path)) return;
+
+        File::put($path, "<?php
+
+namespace App\Traits;
+
+use Illuminate\Database\Eloquent\Builder;
+
+trait ApplyFilter
+{
+    public function applyFilter(Builder \$query, array \$filterData, string \$operator = '='): Builder
+    {
+        foreach (\$filterData as \$column => \$value) {
+            if (!is_null(\$value) && \$value !== '') {
+                \$query->where(\$column, \$operator, \$value);
+            }
+        }
+        return \$query;
+    }
+}");
     }
 
     protected function parseMigration($searchTable)
@@ -107,6 +163,7 @@ trait ApiResponseTrait
 
         $fields = [];
         $rules = [];
+        $searchable = [];
 
         preg_match_all('/\$table->(\w+)\([\'"]([^\'"]+)[\'"]\)([^;]*)/', $content, $matches, PREG_SET_ORDER);
 
@@ -118,29 +175,27 @@ trait ApiResponseTrait
             if (in_array($column, ['id', 'created_at', 'updated_at', 'deleted_at'])) continue;
 
             $fields[] = $column;
+            if (in_array($type, ['string', 'text'])) $searchable[] = $column;
+
             $rule = [Str::contains($extra, 'nullable') ? 'nullable' : 'required'];
-            
             $rule[] = match ($type) {
                 'string' => 'string|max:255',
-                'text', 'longText' => 'string',
-                'integer', 'bigInteger', 'unsignedInteger' => 'integer',
+                'integer' => 'integer',
                 'boolean' => 'boolean',
-                'decimal', 'float', 'double' => 'numeric',
-                'date', 'dateTime', 'timestamp' => 'date',
+                'decimal' => 'numeric',
                 default => 'string',
             };
-
             $rules[$column] = implode('|', $rule);
         }
 
-        return ['table' => $actualTable, 'fields' => $fields, 'rules' => $rules];
+        return ['table' => $actualTable, 'fields' => $fields, 'rules' => $rules, 'searchable' => $searchable];
     }
 
     protected function createModel($name, $table, $fields)
     {
         $fillable = "['" . implode("', '", $fields) . "']";
         $path = app_path("Models/{$name}.php");
-        $template = "<?php
+        File::put($path, "<?php
 
 namespace App\Models;
 
@@ -152,8 +207,7 @@ class {$name} extends Model
     use HasFactory;
     protected \$table = '{$table}';
     protected \$fillable = {$fillable};
-}";
-        File::put($path, $template);
+}");
     }
 
     protected function createRequest($name, $rulesArray)
@@ -165,7 +219,8 @@ class {$name} extends Model
         $rulesExport .= "        ]";
 
         $path = app_path("Http/Requests/{$name}Request.php");
-        $template = "<?php
+        File::ensureDirectoryExists(app_path("Http/Requests"));
+        File::put($path, "<?php
 
 namespace App\Http\Requests;
 
@@ -175,30 +230,47 @@ class {$name}Request extends FormRequest
 {
     public function authorize(): bool { return true; }
     public function rules(): array { return {$rulesExport}; }
-}";
-        File::ensureDirectoryExists(app_path("Http/Requests"));
-        File::put($path, $template);
+}");
     }
 
-    protected function createController($name, $modelVariable)
+    protected function createController($name, $modelVariable, $migrationData)
     {
+        $table = $migrationData['table'];
+        $firstField = $migrationData['fields'][0] ?? 'column';
+        $firstSearch = $migrationData['searchable'][0] ?? 'column';
+
         $path = app_path("Http/Controllers/{$name}Controller.php");
-        $template = "<?php
+        File::put($path, "<?php
 
 namespace App\Http\Controllers;
 
 use App\Models\\{$name};
 use App\Http\Requests\\{$name}Request;
 use App\Traits\ApiResponseTrait;
+use App\Traits\ApplyFilter;
+use App\Traits\ApplySearch;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class {$name}Controller extends Controller
 {
-    use ApiResponseTrait;
+    use ApiResponseTrait, ApplyFilter, ApplySearch;
 
-    public function index(): JsonResponse
+    public function index(Request \$request): JsonResponse
     {
-        \$items = {$name}::paginate(15)->toArray();
+        \$query = {$name}::query();
+
+        // Apply Filters
+        \$query = \$this->applyFilter(\$query, [
+            // '{$table}.{$firstField}' => \$request->input('{$firstField}'),
+        ], '=');
+
+        // Apply Search
+        \$query = \$this->applySearch(\$query, [
+            // '{$table}.{$firstSearch}' => \$request->input('search'),
+        ], 'LIKE');
+
+        \$items = \$query->paginate(15)->toArray();
         return \$this->apiResponse(['data' => \$items, 'action' => 'list']);
     }
 
@@ -224,8 +296,7 @@ class {$name}Controller extends Controller
         \${$modelVariable}->delete();
         return \$this->apiResponse(['action' => 'destroy']);
     }
-}";
-        File::put($path, $template);
+}");
     }
 
     protected function addRoute($name, $pluralName, $modelVariable)
@@ -233,28 +304,15 @@ class {$name}Controller extends Controller
         $routePath = base_path('routes/api.php');
         $controllerName = "{$name}Controller";
         $importStatement = "use App\Http\Controllers\\{$controllerName};";
-        
-        $routes = "
-// {$name} API Routes
-Route::get('{$pluralName}', [{$controllerName}::class, 'index']);
-Route::post('{$pluralName}', [{$controllerName}::class, 'store']);
-Route::get('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'show']);
-Route::patch('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'update']);
-Route::delete('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'destroy']);
-";
+        $routes = "\n// {$name} API Routes\nRoute::get('{$pluralName}', [{$controllerName}::class, 'index']);\nRoute::post('{$pluralName}', [{$controllerName}::class, 'store']);\nRoute::get('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'show']);\nRoute::patch('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'update']);\nRoute::delete('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'destroy']);\n";
 
         $content = File::get($routePath);
-
         if (!Str::contains($content, $importStatement)) {
-            $content = Str::contains($content, 'use ') 
+            $content = Str::contains($content, 'use ')
                 ? Str::replaceFirst('use ', "{$importStatement}\nuse ", $content)
                 : Str::replaceFirst('<?php', "<?php\n\n{$importStatement}", $content);
         }
-
-        if (!Str::contains($content, "Route::get('{$pluralName}'")) {
-            $content .= "\n{$routes}";
-        }
-
+        if (!Str::contains($content, "Route::get('{$pluralName}'")) $content .= $routes;
         File::put($routePath, $content);
     }
 }

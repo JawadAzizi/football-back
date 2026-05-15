@@ -7,10 +7,6 @@ use Illuminate\Http\Response;
 
 trait ApiResponseTrait
 {
-    /**
-     * Smart API Response
-     * @param array $props ['data' => mixed, 'action' => string, 'message' => string, 'code' => int]
-     */
     public function apiResponse(array $props): JsonResponse
     {
         $action  = $props['action'] ?? 'list';

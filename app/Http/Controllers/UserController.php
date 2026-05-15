@@ -5,15 +5,31 @@ namespace App\Http\Controllers;
 use App\Models\User;
 use App\Http\Requests\UserRequest;
 use App\Traits\ApiResponseTrait;
+use App\Traits\ApplyFilter;
+use App\Traits\ApplySearch;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class UserController extends Controller
 {
-    use ApiResponseTrait;
+    use ApiResponseTrait, ApplyFilter, ApplySearch;
 
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
-        $items = User::paginate(15)->toArray();
+        $query = User::query();
+
+        // Apply Filters
+        $query = $this->applyFilter($query, [
+            'users.name' => $request->input('name'),
+        ], '=');
+
+        // Apply Search
+        $query = $this->applySearch($query, [
+            'users.name' => $request->input('search'),
+            'users.email' => $request->input('search'),
+        ], 'LIKE');
+
+        $items = $query->paginate(15)->toArray();
         return $this->apiResponse(['data' => $items, 'action' => 'list']);
     }
 
