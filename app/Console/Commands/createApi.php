@@ -9,7 +9,7 @@ use Illuminate\Support\Str;
 class CreateApi extends Command
 {
     protected $signature = 'make:api {name : The singular name of the model}';
-    protected $description = 'Create a full API CRUD by reading migration table name, columns, and types';
+    protected $description = 'Create a full Smart API CRUD with single-prop Array Responses';
 
     public function handle()
     {
@@ -18,29 +18,72 @@ class CreateApi extends Command
         $searchTable = Str::snake($pluralName);                  
         $modelVariable = Str::camel($name);                     
 
-        $this->info("Searching for migration for: {$searchTable}...");
+        $this->info("Parsing migration for: {$searchTable}...");
         $migrationData = $this->parseMigration($searchTable);
 
         if (!$migrationData) {
-            $this->error("Migration file for [{$searchTable}] not found. Please create it first!");
+            $this->error("Migration file for [{$searchTable}] not found!");
             return;
         }
 
-        $actualTableName = $migrationData['table'];
-
-        // 1. Create Model with explicit $table and $fillable
-        $this->createModel($name, $actualTableName, $migrationData['fields']);
-
-        // 2. Create Request with Validation rules from migration types
+        $this->ensureTraitExists();
+        $this->createModel($name, $migrationData['table'], $migrationData['fields']);
         $this->createRequest($name, $migrationData['rules']);
-
-        // 3. Create Controller with Pagination and Standard Response
         $this->createController($name, $modelVariable);
-        
-        // 4. Add Individual Routes and Top-level Import
         $this->addRoute($name, $pluralName, $modelVariable);
 
-        $this->info("Successfully created API for {$name} (Table: {$actualTableName})!");
+        $this->info("Successfully created Smart API for {$name}!");
+    }
+
+    /**
+     * Creates the Smart Trait with Single Prop Array logic
+     */
+    protected function ensureTraitExists()
+    {
+        $path = app_path('Traits/ApiResponseTrait.php');
+        File::ensureDirectoryExists(app_path('Traits'));
+
+        $template = "<?php
+
+namespace App\Traits;
+
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Response;
+
+trait ApiResponseTrait
+{
+    /**
+     * Smart API Response
+     * @param array \$props ['data' => mixed, 'action' => string, 'message' => string, 'code' => int]
+     */
+    public function apiResponse(array \$props): JsonResponse
+    {
+        \$action  = \$props['action'] ?? 'list';
+        \$data    = \$props['data'] ?? null;
+        \$message = \$props['message'] ?? null;
+        \$code    = \$props['code'] ?? null;
+
+        \$defaults = [
+            'create'  => ['code' => Response::HTTP_CREATED, 'msg' => 'Resource created successfully'],
+            'update'  => ['code' => Response::HTTP_OK, 'msg' => 'Resource updated successfully'],
+            'destroy' => ['code' => Response::HTTP_OK, 'msg' => 'Resource deleted successfully'],
+            'show'    => ['code' => Response::HTTP_OK, 'msg' => 'Resource retrieved successfully'],
+            'list'    => ['code' => Response::HTTP_OK, 'msg' => 'Resources listed successfully'],
+        ];
+
+        \$settings = \$defaults[\$action] ?? ['code' => Response::HTTP_OK, 'msg' => 'Success'];
+        \$finalCode = \$code ?? \$settings['code'];
+
+        return response()->json([
+            'success' => \$finalCode < 400,
+            'action'  => \$action,
+            'message' => \$message ?? \$settings['msg'],
+            'data'    => isset(\$data['data']) ? \$data['data'] : \$data,
+            'meta'    => isset(\$data['current_page']) ? array_diff_key(\$data, ['data' => []]) : null
+        ], \$finalCode);
+    }
+}";
+        File::put($path, $template);
     }
 
     protected function parseMigration($searchTable)
@@ -59,15 +102,12 @@ class CreateApi extends Command
         if (!$targetFile) return null;
 
         $content = File::get($targetFile);
-        
-        // Extract the actual table name from Schema::create('table_name')
         preg_match('/Schema::create\([\'"]([^\'"]+)[\'"]/', $content, $tableMatch);
         $actualTable = $tableMatch[1] ?? $searchTable;
 
         $fields = [];
         $rules = [];
 
-        // Regex to extract column type and name
         preg_match_all('/\$table->(\w+)\([\'"]([^\'"]+)[\'"]\)([^;]*)/', $content, $matches, PREG_SET_ORDER);
 
         foreach ($matches as $match) {
@@ -110,9 +150,7 @@ use Illuminate\Database\Eloquent\Factories\HasFactory;
 class {$name} extends Model
 {
     use HasFactory;
-
     protected \$table = '{$table}';
-
     protected \$fillable = {$fillable};
 }";
         File::put($path, $template);
@@ -136,11 +174,7 @@ use Illuminate\Foundation\Http\FormRequest;
 class {$name}Request extends FormRequest
 {
     public function authorize(): bool { return true; }
-
-    public function rules(): array
-    {
-        return {$rulesExport};
-    }
+    public function rules(): array { return {$rulesExport}; }
 }";
         File::ensureDirectoryExists(app_path("Http/Requests"));
         File::put($path, $template);
@@ -155,48 +189,40 @@ namespace App\Http\Controllers;
 
 use App\Models\\{$name};
 use App\Http\Requests\\{$name}Request;
+use App\Traits\ApiResponseTrait;
 use Illuminate\Http\JsonResponse;
-use Illuminate\Http\Response;
 
 class {$name}Controller extends Controller
 {
-    private function apiResponse(\$data, string \$message = 'Success', int \$code = Response::HTTP_OK): JsonResponse
-    {
-        return response()->json([
-            'success' => \$code < 400,
-            'message' => \$message,
-            'data'    => isset(\$data['data']) ? \$data['data'] : \$data,
-            'meta'    => isset(\$data['current_page']) ? array_diff_key(\$data, ['data' => []]) : null
-        ], \$code);
-    }
+    use ApiResponseTrait;
 
     public function index(): JsonResponse
     {
         \$items = {$name}::paginate(15)->toArray();
-        return \$this->apiResponse(\$items, 'Items retrieved successfully');
+        return \$this->apiResponse(['data' => \$items, 'action' => 'list']);
     }
 
     public function store({$name}Request \$request): JsonResponse
     {
         \${$modelVariable} = {$name}::create(\$request->validated());
-        return \$this->apiResponse(\${$modelVariable}, 'Created successfully', Response::HTTP_CREATED);
+        return \$this->apiResponse(['data' => \${$modelVariable}, 'action' => 'create']);
     }
 
     public function show({$name} \${$modelVariable}): JsonResponse
     {
-        return \$this->apiResponse(\${$modelVariable}, 'Details retrieved');
+        return \$this->apiResponse(['data' => \${$modelVariable}, 'action' => 'show']);
     }
 
     public function update({$name}Request \$request, {$name} \${$modelVariable}): JsonResponse
     {
         \${$modelVariable}->update(\$request->validated());
-        return \$this->apiResponse(\${$modelVariable}, 'Updated successfully');
+        return \$this->apiResponse(['data' => \${$modelVariable}, 'action' => 'update']);
     }
 
     public function destroy({$name} \${$modelVariable}): JsonResponse
     {
         \${$modelVariable}->delete();
-        return \$this->apiResponse(null, 'Deleted successfully', Response::HTTP_NO_CONTENT);
+        return \$this->apiResponse(['action' => 'destroy']);
     }
 }";
         File::put($path, $template);
@@ -219,16 +245,12 @@ Route::delete('{$pluralName}/{{$modelVariable}}', [{$controllerName}::class, 'de
 
         $content = File::get($routePath);
 
-        // 1. Add Controller Import at the top
         if (!Str::contains($content, $importStatement)) {
-            if (Str::contains($content, 'use ')) {
-                $content = Str::replaceFirst('use ', "{$importStatement}\nuse ", $content);
-            } else {
-                $content = Str::replaceFirst('<?php', "<?php\n\n{$importStatement}", $content);
-            }
+            $content = Str::contains($content, 'use ') 
+                ? Str::replaceFirst('use ', "{$importStatement}\nuse ", $content)
+                : Str::replaceFirst('<?php', "<?php\n\n{$importStatement}", $content);
         }
 
-        // 2. Add individual routes at the bottom
         if (!Str::contains($content, "Route::get('{$pluralName}'")) {
             $content .= "\n{$routes}";
         }
